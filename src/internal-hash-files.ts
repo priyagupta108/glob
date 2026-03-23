@@ -8,56 +8,81 @@ import minimatch from 'minimatch'
 import {Globber} from './glob.js'
 import {HashFileOptions} from './internal-hash-file-options.js'
 
+type IMinimatch = minimatch.IMinimatch
 type IMinimatchOptions = minimatch.IOptions
 const {Minimatch} = minimatch
 
-/**
- * Symlink Protection: Checks if the realpath of file is inside any of the realpaths of roots.
- * Prevents files escaping via symlink traversal.
- */
+const IS_WINDOWS = process.platform === 'win32'
+const MAX_WARNED_FILES = 10
+
+const MINIMATCH_OPTIONS: IMinimatchOptions = {
+  dot: true,
+  nobrace: true,
+  nocase: IS_WINDOWS,
+  nocomment: true,
+  noext: true,
+  nonegate: true
+}
+
+type ExcludeMatcher = {
+  absolutePathMatcher: IMinimatch
+  workspaceRelativeMatcher: IMinimatch
+}
+
+// Checks if resolvedFile is inside any of resolvedRoots.
 function isInResolvedRoots(
   resolvedFile: string,
   resolvedRoots: string[]
 ): boolean {
-  // Allow exact root equality, and root directory containment
-  return resolvedRoots.some(
-    root => resolvedFile === root || resolvedFile.startsWith(root + path.sep)
-  )
+  const normalizedFile = IS_WINDOWS ? resolvedFile.toLowerCase() : resolvedFile
+  return resolvedRoots.some(root => {
+    const normalizedRoot = IS_WINDOWS ? root.toLowerCase() : root
+    if (normalizedFile === normalizedRoot) return true
+    const rel = path.relative(normalizedRoot, normalizedFile)
+    return (
+      !path.isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${path.sep}`)
+    )
+  })
 }
 
 function normalizeForMatch(p: string): string {
-  // minimatch expects "/"-style separators
   return p.split(path.sep).join('/')
 }
 
-function mm(pat: string, target: string, matchBase: boolean): boolean {
-  return new Minimatch(pat, {dot: true, matchBase} as IMinimatchOptions).match(
-    target
-  )
+function buildExcludeMatchers(excludePatterns: string[]): ExcludeMatcher[] {
+  return excludePatterns.map(pattern => {
+    const normalizedPattern = normalizeForMatch(pattern)
+    // basename-only pattern (no "/") uses matchBase so "*.log" matches anywhere
+    const isBasenamePattern = !normalizedPattern.includes('/')
+    return {
+      absolutePathMatcher: new Minimatch(normalizedPattern, {
+        ...MINIMATCH_OPTIONS,
+        matchBase: false
+      } as IMinimatchOptions),
+      workspaceRelativeMatcher: new Minimatch(normalizedPattern, {
+        ...MINIMATCH_OPTIONS,
+        matchBase: isBasenamePattern
+      } as IMinimatchOptions)
+    }
+  })
 }
 
 function isExcluded(
-  file: string,
-  excludePatterns: string[],
+  resolvedFile: string,
+  excludeMatchers: ExcludeMatcher[],
   githubWorkspace: string
 ): boolean {
-  if (!excludePatterns || excludePatterns.length === 0) return false
-
-  const abs = path.resolve(file)
-  const absNorm = normalizeForMatch(abs)
-
-  const rel = path.relative(githubWorkspace, abs)
-  const relNorm = normalizeForMatch(rel)
-
-  return excludePatterns.some(pattern => {
-    const pat = normalizeForMatch(pattern)
-
-    // If the pattern is basename-only (no "/"), allow matchBase so "*.log" works anywhere.
-    // Otherwise do path-based matching for patterns like "**/node_modules/**".
-    const isBasenamePattern = !pat.includes('/')
-
-    return mm(pat, absNorm, false) || mm(pat, relNorm, isBasenamePattern)
-  })
+  if (excludeMatchers.length === 0) return false
+  const absolutePath = path.resolve(resolvedFile)
+  const absolutePathForMatch = normalizeForMatch(absolutePath)
+  const workspaceRelativePathForMatch = normalizeForMatch(
+    path.relative(githubWorkspace, absolutePath)
+  )
+  return excludeMatchers.some(
+    m =>
+      m.absolutePathMatcher.match(absolutePathForMatch) ||
+      m.workspaceRelativeMatcher.match(workspaceRelativePathForMatch)
+  )
 }
 
 export async function hashFiles(
@@ -67,33 +92,38 @@ export async function hashFiles(
   verbose: Boolean = false
 ): Promise<string> {
   const writeDelegate = verbose ? core.info : core.debug
-  let hasMatch = false
-
-  // Determine roots for inclusion (default to currentWorkspace)
   const githubWorkspace = currentWorkspace
     ? currentWorkspace
     : (process.env['GITHUB_WORKSPACE'] ?? process.cwd())
-  const roots = options?.roots ?? [githubWorkspace]
   const allowOutside = options?.allowFilesOutsideWorkspace ?? false
-  const excludePatterns: string[] = options?.exclude ?? []
+  const excludeMatchers = buildExcludeMatchers(options?.exclude ?? [])
 
-  // Symlink Protection: resolve all roots up front
-  let resolvedRoots: string[] = []
-  try {
-    resolvedRoots = roots.map(root => fs.realpathSync(root))
-  } catch (err) {
-    core.warning(`Could not check workspace location: ${err}`)
+  // Resolve roots up front; warn and skip any that fail to resolve
+  const resolvedRoots: string[] = []
+  for (const root of options?.roots ?? [githubWorkspace]) {
+    try {
+      resolvedRoots.push(fs.realpathSync(root))
+    } catch (err) {
+      core.warning(`Could not resolve root '${root}': ${err}`)
+    }
+  }
+  if (resolvedRoots.length === 0) {
+    core.warning(
+      `Could not resolve any allowed root(s); no files will be considered for hashing.`
+    )
     return ''
   }
 
   const outsideRootFiles: string[] = []
   const result = crypto.createHash('sha256')
+  const pipeline = util.promisify(stream.pipeline)
+  let hasMatch = false
   let count = 0
 
   for await (const file of globber.globGenerator()) {
     writeDelegate(file)
 
-    // Symlink Protection: resolve real path of the file (use this for exclude + hashing)
+    // Resolve real path of the file for symlink-safe exclude + root checking
     let resolvedFile: string
     try {
       resolvedFile = fs.realpathSync(file)
@@ -101,11 +131,11 @@ export async function hashFiles(
       core.warning(
         `Could not read "${file}". Please check symlinks and file access. Details: ${err}`
       )
-      continue // skip if unable to resolve symlink
+      continue
     }
 
     // Exclude matching patterns (apply to resolved path for symlink-safety)
-    if (isExcluded(resolvedFile, excludePatterns, githubWorkspace)) {
+    if (isExcluded(resolvedFile, excludeMatchers, githubWorkspace)) {
       writeDelegate(`Exclude '${file}' (exclude pattern match).`)
       continue
     }
@@ -115,12 +145,10 @@ export async function hashFiles(
       outsideRootFiles.push(file)
       if (allowOutside) {
         writeDelegate(
-          `Including '${file}' since it is outside the allowed workspace root(s) and 'allowFilesOutsideWorkspace' is enabled.`
+          `Including '${file}' since it is outside the allowed root(s) and 'allowFilesOutsideWorkspace' is enabled.`
         )
       } else {
-        writeDelegate(
-          `Skip '${file}' since it is not under allowed workspace root(s).`
-        )
+        writeDelegate(`Skip '${file}' since it is not under allowed root(s).`)
         continue
       }
     }
@@ -131,7 +159,6 @@ export async function hashFiles(
     }
 
     const hash = crypto.createHash('sha256')
-    const pipeline = util.promisify(stream.pipeline)
     await pipeline(fs.createReadStream(resolvedFile), hash)
     result.write(hash.digest())
     count++
@@ -139,14 +166,18 @@ export async function hashFiles(
   }
   result.end()
 
-  // Warn if any files outside root found without opt-in
+  // Warn if any files outside root were found without opt-in.
   if (!allowOutside && outsideRootFiles.length > 0) {
-    writeDelegate(
-      `Some files are outside your workspace:\n${outsideRootFiles
-        .map(f => `- ${f}`)
-        .join(
-          '\n'
-        )}\nTo include them, set 'allowFilesOutsideWorkspace: true' in your options.`
+    const shown = outsideRootFiles.slice(0, MAX_WARNED_FILES)
+    const remaining = outsideRootFiles.length - shown.length
+    const fileList = shown.map(f => `- ${f}`).join('\n')
+    const suffix =
+      remaining > 0
+        ? `\n  ...and ${remaining} more file(s). Enable debug logging to see all.`
+        : ''
+    core.warning(
+      `Some matched files are outside the allowed root(s) and were skipped:\n${fileList}${suffix}\n` +
+        `To include them, set 'allowFilesOutsideWorkspace: true' in your options.`
     )
   }
 

@@ -441,7 +441,7 @@ describe('globber', () => {
       await glob(`${root}/*Dir*/*nested*/*`, options)
       throw new Error('should not reach here')
     } catch (err) {
-      expect((err as Error).message).toMatch(/broken symbolic link/i)
+      expect(err.message).toMatch(/broken symbolic link/i)
     }
 
     // Not partial match
@@ -477,7 +477,7 @@ describe('globber', () => {
       await glob(`${root}/*`, options)
       throw new Error('should not reach here')
     } catch (err) {
-      expect((err as Error).message).toMatch(/broken symbolic link/i)
+      expect(err.message).toMatch(/broken symbolic link/i)
     }
 
     // Partial match should throw
@@ -485,7 +485,7 @@ describe('globber', () => {
       await glob(`${root}/*/*`, options)
       throw new Error('should not reach here')
     } catch (err) {
-      expect((err as Error).message).toMatch(/broken symbolic link/i)
+      expect(err.message).toMatch(/broken symbolic link/i)
     }
 
     // Not match or partial match
@@ -814,7 +814,7 @@ describe('globber', () => {
       })
       throw new Error('Expected tl.find to throw')
     } catch (err) {
-      expect((err as Error).message).toMatch(/broken symbolic link/)
+      expect(err.message).toMatch(/broken symbolic link/)
     }
   })
 
@@ -838,7 +838,7 @@ describe('globber', () => {
       })
       throw new Error('Expected tl.find to throw')
     } catch (err) {
-      expect((err as Error).message).toMatch(/broken symbolic link/)
+      expect(err.message).toMatch(/broken symbolic link/)
     }
   })
 })

@@ -14,7 +14,7 @@ export declare function create(patterns: string, options?: GlobOptions): Promise
  *
  * @param patterns  Patterns separated by newlines
  * @param currentWorkspace  Workspace used when matching files
- * @param options   Hash file options (now supports roots, allowFilesOutsideWorkspace, exclude)
+ * @param options   Glob options
  * @param verbose   Enables verbose logging
  */
 export declare function hashFiles(patterns: string, currentWorkspace?: string, options?: HashFileOptions, verbose?: Boolean): Promise<string>;
